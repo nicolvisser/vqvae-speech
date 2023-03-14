@@ -1,122 +1,120 @@
 import hydra
-from hydra import utils
-from itertools import chain
-from pathlib import Path
-from tqdm import tqdm
-
-import apex.amp as amp
-import torch
-import torch.nn.functional as F
-import torch.optim as optim
+import torch.nn.functional
+import wandb
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-
-from dataset import SpeechDataset
-from model import Encoder, Decoder
-
-
-def save_checkpoint(encoder, decoder, optimizer, amp, scheduler, step, checkpoint_dir):
-    checkpoint_state = {
-        "encoder": encoder.state_dict(),
-        "decoder": decoder.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "amp": amp.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "step": step}
-    checkpoint_dir.mkdir(exist_ok=True, parents=True)
-    checkpoint_path = checkpoint_dir / "model.ckpt-{}.pt".format(step)
-    torch.save(checkpoint_state, checkpoint_path)
-    print("Saved checkpoint: {}".format(checkpoint_path.stem))
+import torchaudio
+import pytorch_lightning as pl
+from module import VQVAE
+from torch.utils.data import Dataset
+from sklearn import preprocessing
+from torch.nn.functional import cross_entropy
 
 
-@hydra.main(config_path="config/train.yaml")
+class SpeechCommandsDataset(Dataset):
+    def __init__(self, subset):
+        self.dataset = torchaudio.datasets.SPEECHCOMMANDS(
+            root="datasets/speechcommands/",
+            url="speech_commands_v0.01",
+            download=True,
+            subset=subset)
+
+        speaker_ids = []
+        print('encoding speaker labels...')
+        for wav, sr, label, speaker_id, utterance_number in self.dataset:
+            speaker_ids.append(speaker_id)
+
+        self.le = preprocessing.LabelEncoder()
+        self.le.fit(speaker_ids)
+
+        self.num_speakers = torch.IntTensor([len(self.le.classes_)])
+
+    def __getitem__(self, item):
+        wav, sr, label, speaker_id, utterance_number = self.dataset.__getitem__(item)
+        if wav.shape[1] != 16000:
+            wav = torch.nn.functional.pad(wav, (0, 16000 - wav.shape[1]), mode='constant')
+        wav = wav.squeeze()
+        speaker_id = torch.IntTensor(self.le.transform([speaker_id]))
+        return wav, speaker_id
+
+    def __len__(self):
+        return self.dataset.__len__()
+
+
+@hydra.main(version_base=None, config_path="config", config_name="train")
 def train_model(cfg):
-    tensorboard_path = Path(utils.to_absolute_path("tensorboard")) / cfg.checkpoint_dir
-    checkpoint_dir = Path(utils.to_absolute_path(cfg.checkpoint_dir))
-    writer = SummaryWriter(tensorboard_path)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_dataset = SpeechCommandsDataset(subset='training')
+    val_dataset = SpeechCommandsDataset(subset='validation')
 
-    encoder = Encoder(**cfg.model.encoder)
-    decoder = Decoder(**cfg.model.decoder)
-    encoder.to(device)
-    decoder.to(device)
-
-    optimizer = optim.Adam(
-        chain(encoder.parameters(), decoder.parameters()),
-        lr=cfg.training.optimizer.lr)
-    [encoder, decoder], optimizer = amp.initialize([encoder, decoder], optimizer, opt_level="O1")
-    scheduler = optim.lr_scheduler.MultiStepLR(
-        optimizer, milestones=cfg.training.scheduler.milestones,
-        gamma=cfg.training.scheduler.gamma)
-
-    if cfg.resume:
-        print("Resume checkpoint from: {}:".format(cfg.resume))
-        resume_path = utils.to_absolute_path(cfg.resume)
-        checkpoint = torch.load(resume_path, map_location=lambda storage, loc: storage)
-        encoder.load_state_dict(checkpoint["encoder"])
-        decoder.load_state_dict(checkpoint["decoder"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        amp.load_state_dict(checkpoint["amp"])
-        scheduler.load_state_dict(checkpoint["scheduler"])
-        global_step = checkpoint["step"]
-    else:
-        global_step = 0
-
-    root_path = Path(utils.to_absolute_path("datasets")) / cfg.dataset.path
-    dataset = SpeechDataset(
-        root=root_path,
-        hop_length=cfg.preprocessing.hop_length,
-        sr=cfg.preprocessing.sr,
-        sample_frames=cfg.training.sample_frames)
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=cfg.training.batch_size,
+    train_dataloader = DataLoader(
+        dataset=train_dataset,
+        batch_size=3,  # cfg.training.batch_size,
         shuffle=True,
-        num_workers=cfg.training.n_workers,
-        pin_memory=True,
         drop_last=True)
+    #
+    # val_dataloader = DataLoader(
+    #     dataset=val_dataset,
+    #     batch_size=cfg.training.batch_size,
+    #     shuffle=False,
+    #     drop_last=False)
+    #
+    # #wandb.login()
+    #
+    # checkpoint_callback = pl.callbacks.ModelCheckpoint(
+    #     monitor='validation loss',
+    #     mode='min'
+    # )
 
-    n_epochs = cfg.training.n_steps // len(dataloader) + 1
-    start_epoch = global_step // len(dataloader) + 1
+    model = VQVAE(cfg)
 
-    for epoch in range(start_epoch, n_epochs + 1):
-        average_recon_loss = average_vq_loss = average_perplexity = 0
+    for i, batch in enumerate(train_dataloader):
+        wavs, speakers = batch
+        print(f"wav shape: {wavs.shape}")
 
-        for i, (audio, mels, speakers) in enumerate(tqdm(dataloader), 1):
-            audio, mels, speakers = audio.to(device), mels.to(device), speakers.to(device)
+        # resample here
+        log_mel = model.t_amp_to_db(model.t_mel_spec(wavs)) / model.cfg.preprocessing.top_db + 1
+        print(f"log_mel shape: {log_mel.shape}")
 
-            optimizer.zero_grad()
+        wav_mu_law = model.t_mu_law(wavs)
+        print(f"wav_mu_law shape: {wav_mu_law.shape}")
 
-            z, vq_loss, perplexity = encoder(mels)
-            output = decoder(audio[:, :-1], z, speakers)
-            recon_loss = F.cross_entropy(output.transpose(1, 2), audio[:, 1:])
-            loss = recon_loss + vq_loss
+        # might have to revisit benji's code in dataset to see if log_mel and wav corresponds to that
 
-            with amp.scale_loss(loss, optimizer) as scaled_loss:
-                scaled_loss.backward()
+        z, vq_loss, perplexity = model.encoder(log_mel)
+        print(f"z shape: {z.shape}")
 
-            torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), 1)
-            optimizer.step()
-            scheduler.step()
+        output = model.decoder(wav_mu_law, z, speakers)
+        print(f"output shape: {output.shape}")
 
-            average_recon_loss += (recon_loss.item() - average_recon_loss) / i
-            average_vq_loss += (vq_loss.item() - average_vq_loss) / i
-            average_perplexity += (perplexity.item() - average_perplexity) / i
+        recon_loss = cross_entropy(output.transpose(1, 2), wav_mu_law[:, 1:])
 
-            global_step += 1
+        loss = recon_loss + vq_loss
 
-            if global_step % cfg.training.checkpoint_interval == 0:
-                save_checkpoint(
-                    encoder, decoder, optimizer, amp,
-                    scheduler, global_step, checkpoint_dir)
+        print( {"loss": loss, "reconstruction loss": recon_loss, "vq loss": vq_loss})
 
-        writer.add_scalar("recon_loss/train", average_recon_loss, global_step)
-        writer.add_scalar("vq_loss/train", average_vq_loss, global_step)
-        writer.add_scalar("average_perplexity", average_perplexity, global_step)
+        if i == 1:
+            break
 
-        print("epoch:{}, recon loss:{:.2E}, vq loss:{:.2E}, perpexlity:{:.3f}"
-              .format(epoch, average_recon_loss, average_vq_loss, average_perplexity))
+    return
+
+    pl.loggers.WandbLogger(
+        project=cfg.wandb.project,
+        log_model='all',
+        save_dir='checkpoints'
+    )
+
+    trainer = pl.Trainer(
+        fast_dev_run=True,
+        accelerator='gpu',
+        precision=16,
+        max_epochs=cfg.training.num_epochs,
+        callbacks=[checkpoint_callback]
+    )
+
+    trainer.fit(
+        model=model,
+        train_dataloaders=train_dataloader,
+        val_dataloaders=val_dataloader
+    )
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio.transforms
 from torch.distributions import Categorical
 
 from tqdm import tqdm
 import numpy as np
-from preprocess import mulaw_decode
 
 
 def get_gru_cell(gru):
@@ -141,19 +141,22 @@ class VQEmbeddingEMA(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, in_channels, n_speakers, speaker_embedding_dim,
+    def __init__(self, in_channels, num_speakers, speaker_embedding_dim,
                  conditioning_channels, mu_embedding_dim, rnn_channels,
-                 fc_channels, bits, hop_length):
+                 fc_channels, quantization_channels, hop_length):
         super().__init__()
         self.rnn_channels = rnn_channels
-        self.quantization_channels = 2**bits
+
+        self.quantization_channels = quantization_channels
+        self.mu_law_decoder = torchaudio.transforms.MuLawDecoding(quantization_channels=quantization_channels)
+
         self.hop_length = hop_length
 
-        self.speaker_embedding = nn.Embedding(n_speakers, speaker_embedding_dim)
+        self.speaker_embedding = nn.Embedding(num_speakers, speaker_embedding_dim)
         self.rnn1 = nn.GRU(in_channels + speaker_embedding_dim, conditioning_channels,
                            num_layers=2, batch_first=True, bidirectional=True)
         self.mu_embedding = nn.Embedding(self.quantization_channels, mu_embedding_dim)
-        self.rnn2 = nn.GRU(mu_embedding_dim + 2*conditioning_channels, rnn_channels, batch_first=True)
+        self.rnn2 = nn.GRU(mu_embedding_dim + 2 * conditioning_channels, rnn_channels, batch_first=True)
         self.fc1 = nn.Linear(rnn_channels, fc_channels)
         self.fc2 = nn.Linear(fc_channels, self.quantization_channels)
 
@@ -207,5 +210,5 @@ class Decoder(nn.Module):
             output.append(2 * x.float().item() / (self.quantization_channels - 1.) - 1.)
 
         output = np.asarray(output, dtype=np.float64)
-        output = mulaw_decode(output, self.quantization_channels)
+        output = self.mu_law_decoder(output)
         return output

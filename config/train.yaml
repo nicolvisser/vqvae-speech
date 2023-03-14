@@ -1,8 +1,45 @@
-defaults:
-    - dataset: 2019/english
-    - preprocessing: default
-    - model: default
-    - training: default
-
-resume: False
-checkpoint_dir: ???
+wandb:
+  project: vqvae-speech
+dataset:
+  name: speechcommands
+  sr: 16000
+  num_speakers: 1692
+preprocessing:
+  sample_rate: 16000
+  n_fft: 2048
+  win_length: 400
+  hop_length: 160
+  f_min: 50
+  n_mels: 80
+  top_db: 80
+  quantization_channels: 256
+training:
+  batch_size: 52
+  sample_frames: 32
+  optimizer:
+    lr: 4e-4
+  scheduler:
+    milestones:
+      - 300000
+      - 400000
+    gamma: 0.5
+  checkpoint_interval: 20000
+  num_workers: 0
+  num_epochs: 1
+model:
+  encoder:
+    in_channels: ${preprocessing.n_mels}
+    channels: 768
+    n_embeddings: 512
+    embedding_dim: 64
+    jitter: 0.5
+  decoder:
+    in_channels: ${model.encoder.embedding_dim}
+    conditioning_channels: 128
+    num_speakers: ${dataset.num_speakers}
+    speaker_embedding_dim: 64
+    mu_embedding_dim: 256
+    rnn_channels: 896
+    fc_channels: 256
+    quantization_channels: ${preprocessing.quantization_channels}
+    hop_length: ${preprocessing.hop_length}
